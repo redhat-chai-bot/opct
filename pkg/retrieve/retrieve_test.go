@@ -1,6 +1,9 @@
 package retrieve
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"io"
@@ -12,6 +15,17 @@ import (
 
 	sonobuoyclient "github.com/vmware-tanzu/sonobuoy/pkg/client"
 )
+
+// emptyTarGz is a valid minimal empty tar.gz payload (for tests that pass
+// through ScanPatchTarGzipReaderFor which requires valid gzip/tar data).
+var emptyTarGz = func() []byte {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	_ = tw.Close()
+	_ = gz.Close()
+	return buf.Bytes()
+}()
 
 // --- progressReader tests ---
 
@@ -558,8 +572,8 @@ func TestRetrieveResultsRetry_SucceedsOnNthAttempt(t *testing.T) {
 			if n < succeedOn {
 				return nil, nil, errors.New("transient error")
 			}
-			// On success, return an empty reader and a closed error channel.
-			return strings.NewReader(""), ec, nil
+			// On success, return a valid empty tar.gz and a closed error channel.
+			return bytes.NewReader(emptyTarGz), ec, nil
 		},
 	}
 
@@ -613,22 +627,30 @@ func TestRetrieveResultsRetry_CancelDuringRetryWait(t *testing.T) {
 // Additional helper types
 // =====================================================================
 
-// chunkedReader returns one chunk per Read call, then EOF.
+// chunkedReader returns data from its chunks, correctly handling partial
+// reads when the caller's buffer is smaller than the current chunk.
 type chunkedReader struct {
 	chunks []string
 	index  int
+	offset int // position within the current chunk
 }
 
 func (r *chunkedReader) Read(p []byte) (int, error) {
-	if r.index >= len(r.chunks) {
-		return 0, io.EOF
+	for r.index < len(r.chunks) {
+		n := copy(p, r.chunks[r.index][r.offset:])
+		r.offset += n
+		if r.offset >= len(r.chunks[r.index]) {
+			r.index++
+			r.offset = 0
+		}
+		if n > 0 {
+			if r.index >= len(r.chunks) {
+				return n, io.EOF
+			}
+			return n, nil
+		}
 	}
-	n := copy(p, r.chunks[r.index])
-	r.index++
-	if r.index >= len(r.chunks) {
-		return n, io.EOF
-	}
-	return n, nil
+	return 0, io.EOF
 }
 
 // stutteringReader returns (0, nil) a few times before returning data, then EOF.
