@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -176,10 +177,11 @@ func writeResultsToDirectory(ctx context.Context, outputDir string, r io.Reader,
 
 // progressReader wraps an io.Reader and periodically logs the number of bytes read.
 type progressReader struct {
-	r        io.Reader
-	bytes    atomic.Int64
-	interval time.Duration
-	done     chan struct{}
+	r         io.Reader
+	bytes     atomic.Int64
+	interval  time.Duration
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // newProgressReader creates a progressReader that logs bytes read every interval.
@@ -198,8 +200,8 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 	if n > 0 {
 		pr.bytes.Add(int64(n))
 	}
-	if err == io.EOF {
-		close(pr.done)
+	if err != nil {
+		pr.closeOnce.Do(func() { close(pr.done) })
 	}
 	return n, err
 }
