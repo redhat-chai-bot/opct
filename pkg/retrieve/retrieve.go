@@ -1,11 +1,15 @@
 package retrieve
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -26,6 +30,9 @@ func NewCmdRetrieve() *cobra.Command {
 		Short: "Collect results from validation environment",
 		Long:  `Downloads the results archive from the validation environment`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+			defer cancel()
+
 			destinationDirectory, err := os.Getwd()
 			if err != nil {
 				return fmt.Errorf("retrieve finished with errors: %v", err)
@@ -47,7 +54,7 @@ func NewCmdRetrieve() *cobra.Command {
 			}
 
 			log.Info("Collecting results...")
-			if err := retrieveResultsRetry(s.GetSonobuoyClient(), destinationDirectory); err != nil {
+			if err := retrieveResultsRetry(ctx, s.GetSonobuoyClient(), destinationDirectory); err != nil {
 				return fmt.Errorf("retrieve finished with errors: %v", err)
 			}
 
@@ -57,19 +64,29 @@ func NewCmdRetrieve() *cobra.Command {
 	}
 }
 
-func retrieveResultsRetry(sclient sonobuoyclient.Interface, destinationDirectory string) error {
+func retrieveResultsRetry(ctx context.Context, sclient sonobuoyclient.Interface, destinationDirectory string) error {
 	var err error
 	limit := 10 // Retry retrieve 10 times
 	pause := time.Second * 2
 	retries := 1
 	for retries <= limit {
-		err = retrieveResults(sclient, destinationDirectory)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("retrieval cancelled: %w", ctx.Err())
+		default:
+		}
+
+		err = retrieveResults(ctx, sclient, destinationDirectory)
 		if err != nil {
 			log.Warn(err)
 			if retries+1 < limit {
 				log.Warnf("Retrying retrieval %d more times", limit-retries)
 			}
-			time.Sleep(pause)
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("retrieval cancelled during retry wait: %w", ctx.Err())
+			case <-time.After(pause):
+			}
 			retries++
 			continue
 		}
@@ -79,7 +96,7 @@ func retrieveResultsRetry(sclient sonobuoyclient.Interface, destinationDirectory
 	return fmt.Errorf("retrieval retry limit reached")
 }
 
-func retrieveResults(sclient sonobuoyclient.Interface, destinationDirectory string) error {
+func retrieveResults(ctx context.Context, sclient sonobuoyclient.Interface, destinationDirectory string) error {
 	// Get a reader that contains the tar output of the results directory.
 	reader, ec, err := sclient.RetrieveResults(&sonobuoyclient.RetrieveConfig{
 		Namespace: pkg.CertificationNamespace,
@@ -89,11 +106,16 @@ func retrieveResults(sclient sonobuoyclient.Interface, destinationDirectory stri
 		return fmt.Errorf("error retrieving results from sonobuoy: %w", err)
 	}
 
+	// Wrap reader with progress logging
+	pr := newProgressReader(reader, 30*time.Second)
+
 	// Download results into target directory
-	results, err := writeResultsToDirectory(destinationDirectory, reader, ec)
+	results, err := writeResultsToDirectory(ctx, destinationDirectory, pr, ec)
 	if err != nil {
-		return fmt.Errorf("error retrieving results from sonobyuoy: %w", err)
+		return fmt.Errorf("error retrieving results from sonobuoy: %w", err)
 	}
+
+	log.Infof("Download complete: %d bytes received", pr.BytesRead())
 
 	// Log the new files to stdout
 	for _, result := range results {
@@ -109,11 +131,29 @@ func retrieveResults(sclient sonobuoyclient.Interface, destinationDirectory stri
 	return nil
 }
 
-func writeResultsToDirectory(outputDir string, r io.Reader, ec <-chan error) ([]string, error) {
-	eg := &errgroup.Group{}
+func writeResultsToDirectory(ctx context.Context, outputDir string, r io.Reader, ec <-chan error) ([]string, error) {
+	// Use errgroup.WithContext so that if either goroutine fails,
+	// the other is notified via context cancellation.
+	eg, egCtx := errgroup.WithContext(ctx)
 	var results []string
-	eg.Go(func() error { return <-ec })
+
+	// workCtx is cancelled when the scan/extract goroutine finishes,
+	// ensuring the error-channel goroutine does not block indefinitely
+	// if the sonobuoy error channel is never closed.
+	workCtx, workCancel := context.WithCancel(egCtx)
+
 	eg.Go(func() error {
+		select {
+		case err := <-ec:
+			return err
+		case <-workCtx.Done():
+			// The work goroutine finished; stop waiting for the error channel.
+			return nil
+		}
+	})
+	eg.Go(func() error {
+		defer workCancel()
+
 		// scanning for sensitive data
 		scannedReader, _, err := cleaner.ScanPatchTarGzipReaderFor(r)
 		if err != nil {
@@ -132,4 +172,52 @@ func writeResultsToDirectory(outputDir string, r io.Reader, ec <-chan error) ([]
 	})
 
 	return results, eg.Wait()
+}
+
+// progressReader wraps an io.Reader and periodically logs the number of bytes read.
+type progressReader struct {
+	r        io.Reader
+	bytes    atomic.Int64
+	interval time.Duration
+	done     chan struct{}
+}
+
+// newProgressReader creates a progressReader that logs bytes read every interval.
+func newProgressReader(r io.Reader, interval time.Duration) *progressReader {
+	pr := &progressReader{
+		r:        r,
+		interval: interval,
+		done:     make(chan struct{}),
+	}
+	go pr.logProgress()
+	return pr
+}
+
+func (pr *progressReader) Read(p []byte) (int, error) {
+	n, err := pr.r.Read(p)
+	if n > 0 {
+		pr.bytes.Add(int64(n))
+	}
+	if err == io.EOF {
+		close(pr.done)
+	}
+	return n, err
+}
+
+// BytesRead returns the total number of bytes read so far.
+func (pr *progressReader) BytesRead() int64 {
+	return pr.bytes.Load()
+}
+
+func (pr *progressReader) logProgress() {
+	ticker := time.NewTicker(pr.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			log.Infof("Retrieve in progress: %d bytes received so far...", pr.bytes.Load())
+		case <-pr.done:
+			return
+		}
+	}
 }
