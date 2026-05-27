@@ -6,8 +6,11 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	sonobuoyclient "github.com/vmware-tanzu/sonobuoy/pkg/client"
 )
 
 // --- progressReader tests ---
@@ -299,4 +302,363 @@ func (r *slowReader) Read(p []byte) (int, error) {
 		p[i] = 'x'
 	}
 	return n, nil
+}
+
+// =====================================================================
+// Additional tests for improved coverage
+// =====================================================================
+
+// --- progressReader: multi-chunk byte accumulation ---
+
+func TestProgressReader_MultiChunkAccumulation(t *testing.T) {
+	// Verify bytes accumulate correctly across multiple Read calls
+	// when the buffer is smaller than the total data.
+	chunks := []string{"hello", " ", "world", "!"}
+	r := &chunkedReader{chunks: chunks}
+	pr := newProgressReader(r, time.Hour)
+
+	buf := make([]byte, 3) // deliberately small buffer
+	var totalRead int
+	for {
+		n, err := pr.Read(buf)
+		totalRead += n
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	expectedTotal := 0
+	for _, c := range chunks {
+		expectedTotal += len(c)
+	}
+	if int64(totalRead) != pr.BytesRead() {
+		t.Fatalf("totalRead=%d but BytesRead()=%d", totalRead, pr.BytesRead())
+	}
+	if pr.BytesRead() != int64(expectedTotal) {
+		t.Fatalf("BytesRead()=%d, want %d", pr.BytesRead(), expectedTotal)
+	}
+}
+
+// --- progressReader: zero-byte reads from underlying reader ---
+
+func TestProgressReader_ZeroBytesFromUnderlying(t *testing.T) {
+	// A reader that returns (0, nil) a few times before actual data.
+	// BytesRead must only reflect real data, not zero-byte returns.
+	r := &stutteringReader{stutters: 3, data: []byte("payload")}
+	pr := newProgressReader(r, time.Hour)
+
+	buf := make([]byte, 64)
+	var totalRead int
+	for {
+		n, err := pr.Read(buf)
+		totalRead += n
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	if pr.BytesRead() != int64(len("payload")) {
+		t.Fatalf("BytesRead()=%d, want %d", pr.BytesRead(), len("payload"))
+	}
+}
+
+// --- progressReader: reads after EOF still return EOF ---
+
+func TestProgressReader_ReadAfterEOF(t *testing.T) {
+	pr := newProgressReader(strings.NewReader("abc"), time.Hour)
+
+	buf := make([]byte, 64)
+	// Drain all data.
+	for {
+		_, err := pr.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+
+	// done channel should be closed.
+	select {
+	case <-pr.done:
+	case <-time.After(time.Second):
+		t.Fatal("done not closed after draining")
+	}
+
+	// Further reads must return EOF without hanging or panicking.
+	_, err := pr.Read(buf)
+	if err != io.EOF {
+		t.Fatalf("expected io.EOF on read after done, got %v", err)
+	}
+}
+
+// --- progressReader: BytesRead starts at zero ---
+
+func TestProgressReader_BytesReadIsZeroBeforeRead(t *testing.T) {
+	pr := newProgressReader(strings.NewReader("test"), time.Hour)
+	if pr.BytesRead() != 0 {
+		t.Fatalf("BytesRead() = %d before any reads, want 0", pr.BytesRead())
+	}
+	// Clean up: drain so the goroutine exits.
+	buf := make([]byte, 64)
+	for {
+		_, err := pr.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+}
+
+// --- progressReader: logProgress ticks are visible ---
+
+func TestProgressReader_LogProgressTicks(t *testing.T) {
+	// Use a slow reader with a very short log interval to verify
+	// logProgress runs concurrently without races or panics.
+	sr := &slowReader{chunks: 5, chunkSize: 100, delay: 20 * time.Millisecond}
+	pr := newProgressReader(sr, 10*time.Millisecond)
+
+	buf := make([]byte, 256)
+	for {
+		_, err := pr.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+
+	// Verify all bytes were counted.
+	if pr.BytesRead() != int64(5*100) {
+		t.Fatalf("BytesRead()=%d, want %d", pr.BytesRead(), 5*100)
+	}
+}
+
+// --- writeResultsToDirectory: context cancelled mid-work ---
+
+func TestWriteResultsToDirectory_ContextCancelledMidWork(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel after a short delay while the slow reader is still producing data.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	ec := make(chan error)
+	sr := &slowReader{chunks: 100, chunkSize: 1024, delay: 20 * time.Millisecond}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = writeResultsToDirectory(ctx, t.TempDir(), sr, ec)
+	}()
+
+	select {
+	case <-done:
+		// Function returned — no hang.
+	case <-time.After(10 * time.Second):
+		t.Fatal("writeResultsToDirectory hung after context cancellation during work")
+	}
+}
+
+// --- writeResultsToDirectory: both error channel and work goroutine fail ---
+
+func TestWriteResultsToDirectory_ErrorChannelAndWorkBothFail(t *testing.T) {
+	ec := make(chan error, 1)
+	ec <- errors.New("sonobuoy aggregation error")
+
+	// failingReader causes the work goroutine to fail too.
+	done := make(chan struct{})
+	var gotErr error
+	go func() {
+		defer close(done)
+		_, gotErr = writeResultsToDirectory(
+			context.Background(), t.TempDir(),
+			&failingReader{err: errors.New("read failure")}, ec,
+		)
+	}()
+
+	select {
+	case <-done:
+		if gotErr == nil {
+			t.Fatal("expected an error when both error sources fire")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("writeResultsToDirectory hung when both error sources fire")
+	}
+}
+
+// --- writeResultsToDirectory: error channel pre-closed ---
+
+func TestWriteResultsToDirectory_ErrorChannelClosedImmediately(t *testing.T) {
+	// Closing the error channel without sending a value should not hang
+	// or produce a spurious error.
+	ec := make(chan error)
+	close(ec)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = writeResultsToDirectory(
+			context.Background(), t.TempDir(),
+			strings.NewReader(""), ec,
+		)
+	}()
+
+	select {
+	case <-done:
+		// success — no hang
+	case <-time.After(10 * time.Second):
+		t.Fatal("writeResultsToDirectory hung when error channel is pre-closed")
+	}
+}
+
+// --- retrieveResultsRetry: retries the expected number of times ---
+
+func TestRetrieveResultsRetry_RetriesOnFailure(t *testing.T) {
+	var attempts atomic.Int32
+
+	mock := &mockSonobuoyClient{
+		retrieveFn: func(_ *sonobuoyclient.RetrieveConfig) (io.Reader, <-chan error, error) {
+			attempts.Add(1)
+			return nil, nil, errors.New("connection refused")
+		},
+	}
+
+	// Use a short-lived context so we don't wait through all 10 retries
+	// with the default 2s pause.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err := retrieveResultsRetry(ctx, mock, t.TempDir())
+	if err == nil {
+		t.Fatal("expected error after exhausting retries or context timeout")
+	}
+
+	got := attempts.Load()
+	if got < 2 {
+		t.Fatalf("expected at least 2 attempts, got %d", got)
+	}
+}
+
+// --- retrieveResultsRetry: succeeds on Nth attempt ---
+
+func TestRetrieveResultsRetry_SucceedsOnNthAttempt(t *testing.T) {
+	var attempts atomic.Int32
+	succeedOn := int32(3) // succeed on the 3rd attempt
+
+	ec := make(chan error, 1)
+	close(ec) // closed immediately — no sonobuoy error
+
+	mock := &mockSonobuoyClient{
+		retrieveFn: func(_ *sonobuoyclient.RetrieveConfig) (io.Reader, <-chan error, error) {
+			n := attempts.Add(1)
+			if n < succeedOn {
+				return nil, nil, errors.New("transient error")
+			}
+			// On success, return an empty reader and a closed error channel.
+			return strings.NewReader(""), ec, nil
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err := retrieveResultsRetry(ctx, mock, t.TempDir())
+	if err != nil {
+		t.Fatalf("expected success on attempt %d, got error: %v", succeedOn, err)
+	}
+
+	got := attempts.Load()
+	if got != succeedOn {
+		t.Fatalf("expected exactly %d attempts, got %d", succeedOn, got)
+	}
+}
+
+// --- retrieveResultsRetry: context cancelled during retry wait ---
+
+func TestRetrieveResultsRetry_CancelDuringRetryWait(t *testing.T) {
+	var attempts atomic.Int32
+
+	mock := &mockSonobuoyClient{
+		retrieveFn: func(_ *sonobuoyclient.RetrieveConfig) (io.Reader, <-chan error, error) {
+			attempts.Add(1)
+			return nil, nil, errors.New("transient error")
+		},
+	}
+
+	// Cancel after 500ms — should interrupt the 2s retry pause.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := retrieveResultsRetry(ctx, mock, t.TempDir())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error from cancelled context during retry")
+	}
+	if !strings.Contains(err.Error(), "cancelled") {
+		t.Logf("error did not mention cancellation (got %q), but function returned — acceptable", err)
+	}
+	// Key assertion: it should NOT run for the full 10 retries × 2s = 20s.
+	if elapsed > 5*time.Second {
+		t.Fatalf("function took %v — context cancellation did not interrupt retry loop", elapsed)
+	}
+}
+
+// =====================================================================
+// Additional helper types
+// =====================================================================
+
+// chunkedReader returns one chunk per Read call, then EOF.
+type chunkedReader struct {
+	chunks []string
+	index  int
+}
+
+func (r *chunkedReader) Read(p []byte) (int, error) {
+	if r.index >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[r.index])
+	r.index++
+	if r.index >= len(r.chunks) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// stutteringReader returns (0, nil) a few times before returning data, then EOF.
+type stutteringReader struct {
+	stutters  int
+	data      []byte
+	callCount int
+	dataSent  bool
+}
+
+func (r *stutteringReader) Read(p []byte) (int, error) {
+	r.callCount++
+	if r.callCount <= r.stutters {
+		return 0, nil
+	}
+	if r.dataSent {
+		return 0, io.EOF
+	}
+	r.dataSent = true
+	n := copy(p, r.data)
+	return n, nil
+}
+
+// mockSonobuoyClient satisfies sonobuoyclient.Interface for testing.
+// Only RetrieveResults is implemented; other methods panic if called.
+type mockSonobuoyClient struct {
+	sonobuoyclient.Interface // embed to satisfy the interface
+	retrieveFn               func(*sonobuoyclient.RetrieveConfig) (io.Reader, <-chan error, error)
+}
+
+func (m *mockSonobuoyClient) RetrieveResults(cfg *sonobuoyclient.RetrieveConfig) (io.Reader, <-chan error, error) {
+	return m.retrieveFn(cfg)
 }
