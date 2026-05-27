@@ -16,12 +16,22 @@ import (
 	sonobuoyclient "github.com/vmware-tanzu/sonobuoy/pkg/client"
 )
 
-// emptyTarGz is a valid minimal empty tar.gz payload (for tests that pass
-// through ScanPatchTarGzipReaderFor which requires valid gzip/tar data).
+// emptyTarGz is a valid minimal tar.gz payload with one dummy file
+// (for tests that pass through ScanPatchTarGzipReaderFor and UntarAll
+// which require valid gzip/tar data with at least one entry).
 var emptyTarGz = func() []byte {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
+
+	// Add one empty file to satisfy UntarAll's "no valid entries" check
+	header := &tar.Header{
+		Name: "test-results.txt",
+		Mode: 0644,
+		Size: 0,
+	}
+	_ = tw.WriteHeader(header)
+
 	_ = tw.Close()
 	_ = gz.Close()
 	return buf.Bytes()
