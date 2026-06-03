@@ -116,7 +116,7 @@ func retrieveResults(ctx context.Context, sclient sonobuoyclient.Interface, dest
 		return fmt.Errorf("error retrieving results from sonobuoy: %w", err)
 	}
 
-	log.Infof("Download complete: %d bytes received", pr.BytesRead())
+	log.Infof("Download complete: %s received", formatBytes(pr.BytesRead()))
 
 	// Log the new files to stdout
 	for _, result := range results {
@@ -217,9 +217,23 @@ func (pr *progressReader) logProgress() {
 	for {
 		select {
 		case <-ticker.C:
-			log.Infof("Retrieve in progress: %d bytes received so far...", pr.bytes.Load())
+			log.Infof("Retrieve in progress: %s received so far...", formatBytes(pr.bytes.Load()))
 		case <-pr.done:
 			return
 		}
 	}
+}
+
+// formatBytes converts bytes to human-readable format (KiB, MiB, GiB).
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
