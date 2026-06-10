@@ -5,8 +5,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -25,6 +29,10 @@ import (
 	"github.com/redhat-openshift-ecosystem/opct/pkg/status"
 )
 
+// retrieveFunc is the function used by retrieveResultsRetry for each attempt.
+// It is a package-level variable to allow injection in tests.
+var retrieveFunc = retrieveResults
+
 func NewCmdRetrieve() *cobra.Command {
 	var skipRedact bool
 
@@ -34,6 +42,9 @@ func NewCmdRetrieve() *cobra.Command {
 		Short: "Collect results from validation environment",
 		Long:  `Downloads the results archive from the validation environment`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+			defer cancel()
+
 			if skipRedact {
 				log.Warn("═════════════════════════════════════════════════════════════")
 				log.Warn("WARNING: --debug-only-skip-redact is enabled")
@@ -65,7 +76,7 @@ func NewCmdRetrieve() *cobra.Command {
 			}
 
 			log.Info("Collecting results...")
-			if err := retrieveResultsRetry(destinationDirectory); err != nil {
+			if err := retrieveResultsRetry(ctx, destinationDirectory); err != nil {
 				return fmt.Errorf("retrieve finished with errors: %v", err)
 			}
 
@@ -81,19 +92,29 @@ func NewCmdRetrieve() *cobra.Command {
 	return cmd
 }
 
-func retrieveResultsRetry(destinationDirectory string) error {
+func retrieveResultsRetry(ctx context.Context, destinationDirectory string) error {
 	var err error
 	limit := 10
 	pause := time.Second * 2
 	retries := 1
 	for retries <= limit {
-		err = retrieveResults(destinationDirectory)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("retrieval cancelled: %w", ctx.Err())
+		default:
+		}
+
+		err = retrieveFunc(ctx, destinationDirectory)
 		if err != nil {
 			log.Error(err)
 			if retries+1 < limit {
 				log.Warnf("Retrying retrieval %d more times after %d sec", limit-retries, pause/time.Second)
 			}
-			time.Sleep(pause)
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("retrieval cancelled during retry wait: %w", ctx.Err())
+			case <-time.After(pause):
+			}
 			retries++
 			continue
 		}
@@ -103,9 +124,9 @@ func retrieveResultsRetry(destinationDirectory string) error {
 	return fmt.Errorf("retrieval retry limit reached")
 }
 
-func retrieveResults(destinationDirectory string) error {
+func retrieveResults(ctx context.Context, destinationDirectory string) error {
 	// Phase 1: Download archive to temp file
-	tmpFile, err := downloadFromPod()
+	tmpFile, err := downloadFromPod(ctx)
 	if err != nil {
 		return fmt.Errorf("error retrieving results from aggregator server: %w", err)
 	}
@@ -166,7 +187,7 @@ func retrieveResults(destinationDirectory string) error {
 
 // downloadFromPod downloads the results archive from the sonobuoy aggregator pod
 // to a temp file using WebSocket (with SPDY fallback).
-func downloadFromPod() (string, error) {
+func downloadFromPod(ctx context.Context) (string, error) {
 	cli, err := opclient.NewClient()
 	if err != nil {
 		return "", fmt.Errorf("error creating kubernetes client: %w", err)
@@ -215,10 +236,15 @@ func downloadFromPod() (string, error) {
 	log.Debugf("Discovered aggregator server running on pod %s/%s...", pkg.CertificationNamespace, podName)
 	startTime := time.Now()
 
-	err = exec.StreamWithContext(context.Background(), remotecommand.StreamOptions{
-		Stdout: tmpFile,
+	// Wrap temp file with progress tracking to log download progress every 30s
+	pw := newProgressWriter(tmpFile, 30*time.Second)
+
+	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: pw,
 		Tty:    false,
 	})
+	pw.Close()
+
 	if err != nil {
 		_ = tmpFile.Close()
 		_ = os.Remove(tmpFile.Name())
@@ -228,11 +254,122 @@ func downloadFromPod() (string, error) {
 		return "", fmt.Errorf("error closing temp file: %w", err)
 	}
 
-	fi, err := os.Stat(tmpFile.Name())
-	if err != nil {
-		return "", fmt.Errorf("error stat temp file: %w", err)
-	}
-	log.Infof("Downloaded %.1f MB in %s", float64(fi.Size())/(1024*1024), time.Since(startTime).Round(time.Second))
+	log.Infof("Downloaded %s in %s", formatBytes(pw.BytesWritten()), time.Since(startTime).Round(time.Second))
 
 	return tmpFile.Name(), nil
+}
+
+// progressReader wraps an io.Reader and periodically logs the number of bytes read.
+type progressReader struct {
+	r         io.Reader
+	bytes     atomic.Int64
+	interval  time.Duration
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+// newProgressReader creates a progressReader that logs bytes read every interval.
+func newProgressReader(r io.Reader, interval time.Duration) *progressReader {
+	pr := &progressReader{
+		r:        r,
+		interval: interval,
+		done:     make(chan struct{}),
+	}
+	go pr.logProgress()
+	return pr
+}
+
+func (pr *progressReader) Read(p []byte) (int, error) {
+	n, err := pr.r.Read(p)
+	if n > 0 {
+		pr.bytes.Add(int64(n))
+	}
+	if err != nil {
+		pr.closeOnce.Do(func() { close(pr.done) })
+	}
+	return n, err
+}
+
+// BytesRead returns the total number of bytes read so far.
+func (pr *progressReader) BytesRead() int64 {
+	return pr.bytes.Load()
+}
+
+func (pr *progressReader) logProgress() {
+	ticker := time.NewTicker(pr.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			log.Infof("Retrieve in progress: %s received so far...", formatBytes(pr.bytes.Load()))
+		case <-pr.done:
+			return
+		}
+	}
+}
+
+// progressWriter wraps an io.Writer and periodically logs the number of bytes written.
+// It mirrors progressReader but for write operations (e.g., streaming download to disk).
+type progressWriter struct {
+	w         io.Writer
+	bytes     atomic.Int64
+	interval  time.Duration
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+// newProgressWriter creates a progressWriter that logs bytes written every interval.
+func newProgressWriter(w io.Writer, interval time.Duration) *progressWriter {
+	pw := &progressWriter{
+		w:        w,
+		interval: interval,
+		done:     make(chan struct{}),
+	}
+	go pw.logProgress()
+	return pw
+}
+
+func (pw *progressWriter) Write(p []byte) (int, error) {
+	n, err := pw.w.Write(p)
+	if n > 0 {
+		pw.bytes.Add(int64(n))
+	}
+	return n, err
+}
+
+// BytesWritten returns the total number of bytes written so far.
+func (pw *progressWriter) BytesWritten() int64 {
+	return pw.bytes.Load()
+}
+
+// Close stops the progress logging goroutine.
+func (pw *progressWriter) Close() {
+	pw.closeOnce.Do(func() { close(pw.done) })
+}
+
+func (pw *progressWriter) logProgress() {
+	ticker := time.NewTicker(pw.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			log.Infof("Retrieve in progress: %s received so far...", formatBytes(pw.bytes.Load()))
+		case <-pw.done:
+			return
+		}
+	}
+}
+
+// formatBytes converts bytes to human-readable format (KiB, MiB, GiB).
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
