@@ -1,6 +1,7 @@
 package retrieve
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -12,20 +13,37 @@ import (
 	"github.com/spf13/cobra"
 	sonobuoyclient "github.com/vmware-tanzu/sonobuoy/pkg/client"
 	config2 "github.com/vmware-tanzu/sonobuoy/pkg/config"
-	"golang.org/x/sync/errgroup"
+	pluginaggregation "github.com/vmware-tanzu/sonobuoy/pkg/plugin/aggregation"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/httpstream"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/remotecommand"
 
 	"github.com/redhat-openshift-ecosystem/opct/internal/cleaner"
 	"github.com/redhat-openshift-ecosystem/opct/pkg"
+	opclient "github.com/redhat-openshift-ecosystem/opct/pkg/client"
 	"github.com/redhat-openshift-ecosystem/opct/pkg/status"
 )
 
 func NewCmdRetrieve() *cobra.Command {
-	return &cobra.Command{
+	var skipRedact bool
+
+	cmd := &cobra.Command{
 		Use:   "retrieve",
 		Args:  cobra.MaximumNArgs(1),
 		Short: "Collect results from validation environment",
 		Long:  `Downloads the results archive from the validation environment`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if skipRedact {
+				log.Warn("═════════════════════════════════════════════════════════════")
+				log.Warn("WARNING: --debug-only-skip-redact is enabled")
+				log.Warn("WARNING: Sensitive data will NOT be redacted from the archive")
+				log.Warn("WARNING: DO NOT share this archive externally")
+				log.Warn("WARNING: Archive may contain credentials, tokens, and secrets")
+				log.Warn("═════════════════════════════════════════════════════════════")
+				cleaner.SkipRedaction = true
+			}
+
 			destinationDirectory, err := os.Getwd()
 			if err != nil {
 				return fmt.Errorf("retrieve finished with errors: %v", err)
@@ -47,57 +65,94 @@ func NewCmdRetrieve() *cobra.Command {
 			}
 
 			log.Info("Collecting results...")
-			if err := retrieveResultsRetry(s.GetSonobuoyClient(), destinationDirectory); err != nil {
+			if err := retrieveResultsRetry(destinationDirectory); err != nil {
 				return fmt.Errorf("retrieve finished with errors: %v", err)
 			}
 
-			log.Info("Use the results command to check the validation test summary or share the results archive with your Red Hat partner.")
+			log.Info("Run 'opct report -s ./report <archive>.tar.gz' to review the validation results.")
 			return nil
 		},
 	}
+
+	cmd.Flags().BoolVar(&skipRedact, "debug-only-skip-redact", false,
+		"Skip redaction of sensitive data (DEBUG ONLY - NOT RECOMMENDED)")
+	_ = cmd.Flags().MarkHidden("debug-only-skip-redact")
+
+	return cmd
 }
 
-func retrieveResultsRetry(sclient sonobuoyclient.Interface, destinationDirectory string) error {
+func retrieveResultsRetry(destinationDirectory string) error {
 	var err error
-	limit := 10 // Retry retrieve 10 times
+	limit := 10
 	pause := time.Second * 2
 	retries := 1
 	for retries <= limit {
-		err = retrieveResults(sclient, destinationDirectory)
+		err = retrieveResults(destinationDirectory)
 		if err != nil {
-			log.Warn(err)
+			log.Error(err)
 			if retries+1 < limit {
-				log.Warnf("Retrying retrieval %d more times", limit-retries)
+				log.Warnf("Retrying retrieval %d more times after %d sec", limit-retries, pause/time.Second)
 			}
 			time.Sleep(pause)
 			retries++
 			continue
 		}
-		return nil // Retrieved results without a problem
+		return nil
 	}
 
 	return fmt.Errorf("retrieval retry limit reached")
 }
 
-func retrieveResults(sclient sonobuoyclient.Interface, destinationDirectory string) error {
-	// Get a reader that contains the tar output of the results directory.
-	reader, ec, err := sclient.RetrieveResults(&sonobuoyclient.RetrieveConfig{
-		Namespace: pkg.CertificationNamespace,
-		Path:      config2.AggregatorResultsPath,
-	})
+func retrieveResults(destinationDirectory string) error {
+	// Phase 1: Download archive to temp file
+	tmpFile, err := downloadFromPod()
 	if err != nil {
-		return fmt.Errorf("error retrieving results from sonobuoy: %w", err)
+		return fmt.Errorf("error retrieving results from aggregator server: %w", err)
+	}
+	defer func() { _ = os.Remove(tmpFile) }()
+
+	// Phase 2: Scan/redact from disk
+	log.Info("Scanning archive for sensitive data...")
+	fin, err := os.Open(tmpFile)
+	if err != nil {
+		return fmt.Errorf("error opening downloaded archive: %w", err)
+	}
+	defer func() { _ = fin.Close() }()
+
+	scannedReader, _, err := cleaner.ScanPatchTarGzipReaderFor(fin)
+	if err != nil {
+		return fmt.Errorf("error scanning results: %w", err)
 	}
 
-	// Download results into target directory
-	results, err := writeResultsToDirectory(destinationDirectory, reader, ec)
+	// Phase 3: Save scanned archive and extract
+	scannedFile, err := os.CreateTemp("", "opct-scanned-*.tar.gz")
 	if err != nil {
-		return fmt.Errorf("error retrieving results from sonobyuoy: %w", err)
+		return fmt.Errorf("error creating temp file for scanned archive: %w", err)
+	}
+	scannedPath := scannedFile.Name()
+	defer func() { _ = os.Remove(scannedPath) }()
+
+	if _, err := io.Copy(scannedFile, scannedReader); err != nil {
+		_ = scannedFile.Close()
+		return fmt.Errorf("error writing scanned archive: %w", err)
+	}
+	if err := scannedFile.Close(); err != nil {
+		return fmt.Errorf("error closing scanned archive: %w", err)
 	}
 
-	// Log the new files to stdout
-	for _, result := range results {
-		// Rename the file prepending 'opct_' to the name.
+	// Reopen for extraction
+	scannedIn, err := os.Open(scannedPath)
+	if err != nil {
+		return fmt.Errorf("error reopening scanned archive: %w", err)
+	}
+	defer func() { _ = scannedIn.Close() }()
+
+	filesCreated, err := sonobuoyclient.UntarAll(scannedIn, destinationDirectory, "")
+	if err != nil {
+		return fmt.Errorf("error extracting results: %w", err)
+	}
+
+	for _, result := range filesCreated {
 		newFile := fmt.Sprintf("%s/opct_%s", filepath.Dir(result), strings.Replace(filepath.Base(result), "sonobuoy_", "", 1))
 		log.Debugf("Renaming %s to %s", result, newFile)
 		if err := os.Rename(result, newFile); err != nil {
@@ -109,27 +164,75 @@ func retrieveResults(sclient sonobuoyclient.Interface, destinationDirectory stri
 	return nil
 }
 
-func writeResultsToDirectory(outputDir string, r io.Reader, ec <-chan error) ([]string, error) {
-	eg := &errgroup.Group{}
-	var results []string
-	eg.Go(func() error { return <-ec })
-	eg.Go(func() error {
-		// scanning for sensitive data
-		scannedReader, _, err := cleaner.ScanPatchTarGzipReaderFor(r)
-		if err != nil {
-			return fmt.Errorf("error scanning results: %w", err)
-		}
+// downloadFromPod downloads the results archive from the sonobuoy aggregator pod
+// to a temp file using WebSocket (with SPDY fallback).
+func downloadFromPod() (string, error) {
+	cli, err := opclient.NewClient()
+	if err != nil {
+		return "", fmt.Errorf("error creating kubernetes client: %w", err)
+	}
 
-		// This untars the request itself, which is tar'd as just part of the API request, not the sonobuoy logic.
-		filesCreated, err := sonobuoyclient.UntarAll(scannedReader, outputDir, "")
-		if err != nil {
-			return err
-		}
-		// Only print the filename if not extracting. Allows capturing the filename for scripting.
-		results = append(results, filesCreated...)
+	podName, err := pluginaggregation.GetAggregatorPodName(cli.KClient, pkg.CertificationNamespace)
+	if err != nil {
+		return "", fmt.Errorf("failed to get aggregator server's pod: %w", err)
+	}
 
-		return nil
+	restClient := cli.KClient.CoreV1().RESTClient()
+	req := restClient.Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(pkg.CertificationNamespace).
+		SubResource("exec").
+		Param("container", config2.AggregatorContainerName)
+	req.VersionedParams(&corev1.PodExecOptions{
+		Container: config2.AggregatorContainerName,
+		Command:   []string{"/sonobuoy", "splat", config2.AggregatorResultsPath},
+		Stdin:     false,
+		Stdout:    true,
+		Stderr:    false,
+	}, scheme.ParameterCodec)
+
+	// WebSocket primary, SPDY fallback
+	wsExec, err := remotecommand.NewWebSocketExecutor(cli.RestConfig, "POST", req.URL().String())
+	if err != nil {
+		return "", fmt.Errorf("error creating WebSocket executor: %w", err)
+	}
+	spdyExec, err := remotecommand.NewSPDYExecutor(cli.RestConfig, "POST", req.URL())
+	if err != nil {
+		return "", fmt.Errorf("error creating SPDY executor: %w", err)
+	}
+	exec, err := remotecommand.NewFallbackExecutor(wsExec, spdyExec, httpstream.IsUpgradeFailure)
+	if err != nil {
+		return "", fmt.Errorf("error creating fallback executor: %w", err)
+	}
+
+	tmpFile, err := os.CreateTemp("", "opct-retrieve-*.tar.gz")
+	if err != nil {
+		return "", fmt.Errorf("error creating temp file: %w", err)
+	}
+
+	log.Infof("Downloading archive from aggregator server...")
+	log.Debugf("Discovered aggregator server running on pod %s/%s...", pkg.CertificationNamespace, podName)
+	startTime := time.Now()
+
+	err = exec.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+		Stdout: tmpFile,
+		Tty:    false,
 	})
+	if err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("error streaming results from pod: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return "", fmt.Errorf("error closing temp file: %w", err)
+	}
 
-	return results, eg.Wait()
+	fi, err := os.Stat(tmpFile.Name())
+	if err != nil {
+		return "", fmt.Errorf("error stat temp file: %w", err)
+	}
+	log.Infof("Downloaded %.1f MB in %s", float64(fi.Size())/(1024*1024), time.Since(startTime).Round(time.Second))
+
+	return tmpFile.Name(), nil
 }

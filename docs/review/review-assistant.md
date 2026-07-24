@@ -57,8 +57,8 @@ mkdir ${CLAUDE_WORKDIR}
 cd ${CLAUDE_WORKDIR}
 
 # Download Claude configuration for OPCT
-wget https://raw.githubusercontent.com/redhat-openshift-ecosystem/opct/refs/heads/main/docs/devel/review/assistant-assets/settings.local.json
-wget https://raw.githubusercontent.com/redhat-openshift-ecosystem/opct/refs/heads/main/docs/devel/review/assistant-assets/system.prompt.txt
+wget https://raw.githubusercontent.com/redhat-openshift-ecosystem/opct/refs/heads/main/docs/review/assistant-assets/settings.local.json
+wget https://raw.githubusercontent.com/redhat-openshift-ecosystem/opct/refs/heads/main/docs/review/assistant-assets/system.prompt.txt
 ```
 
 > **Note:** You can also manually copy the [`system.prompt.txt`](./assistant-assets/system.prompt.txt) and [`settings.local.json`](./assistant-assets/settings.local.json) files instead of downloading them.

@@ -270,3 +270,126 @@ jobs:
             echo "Got: ${count}"
             echo "Want: ${want}"
           fi
+
+  e2e-cmd_adm-cleaner-leak-detection:
+    name: "e2e-cmd_adm-cleaner-leak-detection"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@484a0b528fb4d7bd804637ccb632e47a0e638317  # v4
+        with:
+          name: opct-linux-amd64
+          path: /tmp/build/
+
+      - name: Create test archive with sensitive data
+        env:
+          TEST_ARCHIVE: /tmp/test-leaks.tar.gz
+        run: |
+          mkdir -p /tmp/test-data/secrets
+          mkdir -p /tmp/test-data/config
+
+          # Build test secrets from fragments to avoid triggering repository secret scanners
+          OCP_TOKEN="sha256~abcdefghijklmnop""qrstuvwxyz01234567890ABCDEF"
+          AWS_KEY="AKIAIOSF""ODNN7EXAMPLE"
+          GCP_KEY="AIzaSyA1234567890""abcdefghijklmnopqrstuv"
+          DB_PASS="supersecret""value123"
+
+          # Create files with various leak patterns
+          echo "token: ${OCP_TOKEN}" > /tmp/test-data/secrets/token.txt
+          echo "AWS_ACCESS_KEY_ID=${AWS_KEY}" > /tmp/test-data/config/aws.env
+          echo "api_key: ${GCP_KEY}" > /tmp/test-data/config/gcp.yaml
+          echo "DATABASE_PASSWORD=${DB_PASS}" > /tmp/test-data/config/db.env
+
+          # Create clean file (should not trigger any warnings)
+          echo "This is a normal log file with no secrets" > /tmp/test-data/normal.log
+          echo "openshift version 4.22" >> /tmp/test-data/normal.log
+
+          # Create the test archive
+          tar czf ${TEST_ARCHIVE} -C /tmp test-data
+
+      - name: Run cleaner with leak detection
+        env:
+          OPCT: /tmp/build/opct-linux-amd64
+          TEST_ARCHIVE: /tmp/test-leaks.tar.gz
+          OUTPUT_ARCHIVE: /tmp/cleaned.tar.gz
+        run: |
+          set -o pipefail
+          chmod u+x ${OPCT}
+
+          echo "> Running cleaner with leak detection (expect warnings)"
+          ${OPCT} adm cleaner \
+            --input ${TEST_ARCHIVE} \
+            --output ${OUTPUT_ARCHIVE} 2>&1 | tee /tmp/cleaner-output.log
+
+          # Verify output archive was created
+          if [[ ! -f ${OUTPUT_ARCHIVE} ]]; then
+            echo "ERROR: Output archive not created"
+            exit 1
+          fi
+
+      - name: Verify redaction in output archive
+        env:
+          OUTPUT_ARCHIVE: /tmp/cleaned.tar.gz
+        run: |
+          echo "> Verifying sensitive data was redacted in output archive"
+
+          # Extract output archive
+          mkdir -p /tmp/extracted
+          tar xzf ${OUTPUT_ARCHIVE} -C /tmp/extracted
+
+          # Verify redaction markers are present
+          if ! grep -r "<REDACTED_BY_OPCT>" /tmp/extracted; then
+            echo "ERROR: No redaction markers found in output archive"
+            echo "Expected to find <REDACTED_BY_OPCT> markers"
+            exit 1
+          fi
+
+          echo "✓ Found redaction markers in archive"
+
+          # Count redaction markers (should be at least 4 - one per test secret)
+          redaction_count=$(grep -r "<REDACTED_BY_OPCT>" /tmp/extracted | wc -l)
+          if [[ ${redaction_count} -lt 4 ]]; then
+            echo "ERROR: Expected at least 4 redactions, found ${redaction_count}"
+            exit 1
+          fi
+
+          echo "✓ Found ${redaction_count} redaction marker(s)"
+
+      - name: Verify original secrets are NOT present
+        run: |
+          echo "> Verifying original secrets are NOT in output archive"
+
+          # Build secrets from fragments (same as creation step)
+          secrets=(
+            "sha256~abcdefghijklmnop""qrstuvwxyz01234567890ABCDEF"
+            "AKIAIOSF""ODNN7EXAMPLE"
+            "AIzaSyA1234567890""abcdefghijklmnopqrstuv"
+            "supersecret""value123"
+          )
+
+          found_leak=0
+          for secret in "${secrets[@]}"; do
+            if grep -qr "${secret}" /tmp/extracted; then
+              echo "ERROR: Original secret still present in archive: ${secret}"
+              found_leak=1
+            else
+              echo "✓ Secret redacted: ${secret:0:20}..."
+            fi
+          done
+
+          if [[ ${found_leak} -ne 0 ]]; then
+            echo "ERROR: Found unredacted secrets in output archive"
+            exit 1
+          fi
+
+          echo "> All secrets successfully redacted!"
+
+      - name: Verify clean files are preserved
+        run: |
+          # Verify clean files don't get corrupted
+          if ! grep -qr "This is a normal log file with no secrets" /tmp/extracted; then
+            echo "ERROR: Clean file content was corrupted or removed"
+            exit 1
+          fi
+
+          echo "✓ Clean files preserved correctly"
