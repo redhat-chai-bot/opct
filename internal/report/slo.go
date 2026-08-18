@@ -832,22 +832,32 @@ The maximum value is the highest value of slow requests reported in the etcd log
 				plugin.PluginNameArtifactsCollector,
 			}
 			invalidPluginIds := []string{}
-			for _, plugin := range checkPlugins {
-				if _, ok := re.Provider.Plugins[plugin]; !ok {
-					if isUpgrade {
+			skippedConformance := false
+			for _, pluginName := range checkPlugins {
+				if _, ok := re.Provider.Plugins[pluginName]; !ok {
+					if isUpgrade &&
+						(pluginName == plugin.PluginNameKubernetesConformance ||
+							pluginName == plugin.PluginNameOpenShiftConformance) {
+						skippedConformance = true
 						continue
 					}
 					return res
 				}
-				p := re.Provider.Plugins[plugin]
+				p := re.Provider.Plugins[pluginName]
 				if p.Stat.Total == p.Stat.Failed {
 					log.Debugf("%s Runtime: Total and Failed counters are equals indicating execution failure", prefix)
-					invalidPluginIds = append(invalidPluginIds, strings.Split(plugin, "-")[0])
+					invalidPluginIds = append(invalidPluginIds, strings.Split(pluginName, "-")[0])
 				}
 			}
 
 			if len(invalidPluginIds) > 0 {
 				res.Actual = fmt.Sprintf("Failed%v", invalidPluginIds)
+				return res
+			}
+
+			if skippedConformance {
+				res.Name = CheckResultNameSkip
+				res.Actual = "skipped (upgrade mode)"
 				return res
 			}
 
