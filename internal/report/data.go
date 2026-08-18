@@ -514,7 +514,7 @@ func (re *ReportData) populateSource(rs *summary.ResultSummary) error {
 	if rs.Sonobuoy != nil && rs.Sonobuoy.MetaConfig != nil {
 		reResult.Runtime.ServerConfig = rs.Sonobuoy.MetaConfig
 	}
-	if rs.Sonobuoy != nil && rs.Sonobuoy.MetaConfig != nil {
+	if rs.Sonobuoy != nil && rs.Sonobuoy.OpctConfig != nil {
 		reResult.Runtime.OpctConfig = rs.Sonobuoy.OpctConfig
 	}
 
@@ -553,7 +553,7 @@ func (re *ReportData) populateSource(rs *summary.ResultSummary) error {
 	}
 	for i := range reResult.Runtime.OpctConfig {
 		if reResult.Runtime.OpctConfig[i].Name == "run-mode" {
-			re.Setup.API.Workflow = reResult.Runtime.ServerConfig[i].Value
+			re.Setup.API.Workflow = reResult.Runtime.OpctConfig[i].Value
 		}
 	}
 	return nil
