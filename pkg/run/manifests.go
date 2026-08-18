@@ -63,7 +63,7 @@ func loadPluginManifests(r *RunOptions) ([]*manifest.Manifest, error) {
 		// Skip conformance plugins (10, 20, 80) in upgrade mode.
 		// These plugins produce invalid results due to binary/release version
 		// mismatch when the cluster is upgraded mid-run.
-		if r.mode == "upgrade" {
+		if r.mode == plugin.WorkflowUpgrade {
 			pluginName := asset.SonobuoyConfig.PluginName
 			switch pluginName {
 			case plugin.PluginNameKubernetesConformance,

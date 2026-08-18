@@ -234,7 +234,7 @@ $ omc get pods -A |egrep -v '(Running|Completed)'
 			res := CheckResult{Name: CheckResultNameFail, Target: "Priority==0|Total!=Failed"}
 			prefix := "Check Failed - " + CheckID001
 			if _, ok := re.Provider.Plugins[plugin.PluginNameKubernetesConformance]; !ok {
-				if re.Setup != nil && re.Setup.API != nil && re.Setup.API.Workflow == "upgrade" {
+				if re.Setup != nil && re.Setup.API != nil && re.Setup.API.Workflow == plugin.WorkflowUpgrade {
 					return CheckResult{Name: CheckResultNameSkip, Actual: "skipped (upgrade mode)"}
 				}
 				log.Debugf("%s Runtime: processed plugin data not found: %v", prefix, re.Provider.Plugins[plugin.PluginNameKubernetesConformance])
@@ -290,7 +290,7 @@ $ /opct report archive.tar.gz
 				Target: "Pass>=98.5%(Fail>1.5%)",
 			}
 			if _, ok := re.Provider.Plugins[plugin.PluginNameOpenShiftConformance]; !ok {
-				if re.Setup != nil && re.Setup.API != nil && re.Setup.API.Workflow == "upgrade" {
+				if re.Setup != nil && re.Setup.API != nil && re.Setup.API.Workflow == plugin.WorkflowUpgrade {
 					return CheckResult{Name: CheckResultNameSkip, Actual: "skipped (upgrade mode)"}
 				}
 				return res
@@ -350,7 +350,7 @@ $ firefox http://localhost:8000
 				Actual: "N/A",
 			}
 			if _, ok := re.Provider.Plugins[plugin.PluginNameOpenShiftConformance]; !ok {
-				if re.Setup != nil && re.Setup.API != nil && re.Setup.API.Workflow == "upgrade" {
+				if re.Setup != nil && re.Setup.API != nil && re.Setup.API.Workflow == plugin.WorkflowUpgrade {
 					return CheckResult{Name: CheckResultNameSkip, Actual: "skipped (upgrade mode)"}
 				}
 				return res
@@ -406,7 +406,7 @@ Check the test logs for OpenShift conformance suite, Priority section, to isolat
 				Actual: "N/A",
 			}
 			if _, ok := re.Provider.Plugins[plugin.PluginNameOpenShiftConformance]; !ok {
-				if re.Setup != nil && re.Setup.API != nil && re.Setup.API.Workflow == "upgrade" {
+				if re.Setup != nil && re.Setup.API != nil && re.Setup.API.Workflow == plugin.WorkflowUpgrade {
 					return CheckResult{Name: CheckResultNameSkip, Actual: "skipped (upgrade mode)"}
 				}
 				return res
@@ -824,7 +824,7 @@ The maximum value is the highest value of slow requests reported in the etcd log
 		Test: func() CheckResult {
 			prefix := "Check Failed - " + CheckID022
 
-			isUpgrade := re.Setup != nil && re.Setup.API != nil && re.Setup.API.Workflow == "upgrade"
+			isUpgrade := re.Setup != nil && re.Setup.API != nil && re.Setup.API.Workflow == plugin.WorkflowUpgrade
 			res := CheckResult{Name: CheckResultNameFail, Target: "passed", Actual: "N/A"}
 			checkPlugins := []string{
 				plugin.PluginNameKubernetesConformance,
@@ -889,7 +889,7 @@ Possible causes of failed plugins:
 				Actual: "N/A",
 			}
 			if _, ok := re.Provider.Plugins[plugin.PluginNameKubernetesConformance]; !ok {
-				if re.Setup != nil && re.Setup.API != nil && re.Setup.API.Workflow == "upgrade" {
+				if re.Setup != nil && re.Setup.API != nil && re.Setup.API.Workflow == plugin.WorkflowUpgrade {
 					res.Name = CheckResultNameSkip
 					res.Actual = "skipped (upgrade mode)"
 					return res
@@ -926,7 +926,7 @@ conformance suite across different releases. This test is a sanity test to ensur
 				Actual: "N/A",
 			}
 			if _, ok := re.Provider.Plugins[plugin.PluginNameOpenShiftConformance]; !ok {
-				if re.Setup != nil && re.Setup.API != nil && re.Setup.API.Workflow == "upgrade" {
+				if re.Setup != nil && re.Setup.API != nil && re.Setup.API.Workflow == plugin.WorkflowUpgrade {
 					res.Name = CheckResultNameSkip
 					res.Actual = "skipped (upgrade mode)"
 					return res
