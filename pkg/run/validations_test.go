@@ -91,6 +91,20 @@ func TestValidateClusterAge(t *testing.T) {
 	}
 }
 
+func TestNormalizeTimeToClusterTimezone(t *testing.T) {
+	clusterLocation := time.FixedZone("cluster", -7*60*60)
+	now := time.Date(2026, time.September, 2, 6, 0, 0, 0, time.UTC)
+	clusterTime := time.Date(2026, time.September, 1, 23, 0, 0, 0, clusterLocation)
+
+	normalized := normalizeTimeToClusterTimezone(now, clusterTime)
+	if normalized.Location() != clusterLocation {
+		t.Errorf("normalizeTimeToClusterTimezone() location = %s, want %s", normalized.Location(), clusterLocation)
+	}
+	if !normalized.Equal(now) {
+		t.Errorf("normalizeTimeToClusterTimezone() = %s, want instant %s", normalized, now)
+	}
+}
+
 // TestValidateOpctNamespace tests the validateOpctNamespace function
 func TestValidateOpctNamespace(t *testing.T) {
 	tests := []struct {

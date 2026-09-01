@@ -206,6 +206,7 @@ func NewCmdRun() *cobra.Command {
 	cmd.Flags().BoolVar(&o.dryRun, "dry-run", defaultDryRunFlag, "Run preflight checks only without creating resources")
 	cmd.Flags().BoolVarP(&o.verbose, "verbose", "v", defaultVerboseFlag, "Print rendered plugin manifests to stdout")
 	cmd.Flags().BoolVar(&o.devSkipChecks, "devel-skip-checks", false, "Developer Mode only: skip checks")
+	cmd.Flags().BoolVar(&o.devSkipChecks, "unsupported-skip-checks", false, "Unsupported: alias for --devel-skip-checks")
 
 	// dev-count is an alias of devel-limit-tests (both flags bind to the same variable).
 	// TODO(mtulio): remove this flag in the future.

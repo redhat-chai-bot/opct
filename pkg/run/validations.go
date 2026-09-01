@@ -191,7 +191,8 @@ func validateImageRegistry(r *RunOptions, restConfig *rest.Config) []error {
 	return result
 }
 
-// validateClusterAge checks the live install manifests ConfigMap creation time.
+// validateClusterAge blocks old clusters because prior workflow telemetry and logs
+// can affect conformance results; OpenShift CI validates fresh installations.
 func validateClusterAge(coreClient corev1.CoreV1Interface, now time.Time) []error {
 	checkMsgPrefix := "Validating cluster age"
 	log.Debug(checkMsgPrefix)
@@ -205,6 +206,7 @@ func validateClusterAge(coreClient corev1.CoreV1Interface, now time.Time) []erro
 		return []error{fmt.Errorf("%s: install manifests ConfigMap has no creation timestamp", checkMsgPrefix)}
 	}
 
+	now = normalizeTimeToClusterTimezone(now, installManifests.CreationTimestamp.Time)
 	age := now.Sub(installManifests.CreationTimestamp.Time)
 	if age > clusterAgeBlockingThreshold {
 		return []error{fmt.Errorf("%s: cluster is %s old, which exceeds the 24-hour limit; install a fresh cluster and try again", checkMsgPrefix, age.Round(time.Second))}
@@ -214,6 +216,10 @@ func validateClusterAge(coreClient corev1.CoreV1Interface, now time.Time) []erro
 	}
 
 	return nil
+}
+
+func normalizeTimeToClusterTimezone(now, clusterTime time.Time) time.Time {
+	return now.In(clusterTime.Location())
 }
 
 // validateDedicatedNode validates that the dedicated node is set and has the required label and taints
