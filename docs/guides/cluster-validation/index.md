@@ -88,12 +88,16 @@ Summary:
 
 ## Prerequisites <a name="prerequisites"></a>
 
-A Red Hat OpenShift 4 cluster must be
+A Red Hat OpenShift 4 or newer cluster must be
 [installed](https://docs.openshift.com/container-platform/latest/installing/index.html)
 before validation can begin. The OpenShift cluster must be installed
 on your infrastructure as if it were a production environment.
 Ensure that each feature of your infrastructure that you plan to
 support with OpenShift is configured in the cluster (e.g. Load Balancers, Storage, special hardware).
+
+!!! info "Fresh OpenShift installation required"
+    Conformance tests require a fresh OpenShift installation to submit results to
+    Red Hat; otherwise, SLOs may not be calibrated with the expected results.
 
 ### OpenShift topologies
 
