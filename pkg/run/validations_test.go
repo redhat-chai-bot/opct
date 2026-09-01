@@ -1,14 +1,95 @@
 package run
 
 import (
+	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/redhat-openshift-ecosystem/opct/pkg"
 	kcorev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
+
+func TestValidateClusterAge(t *testing.T) {
+	now := time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name           string
+		creationTime   time.Time
+		clientError    error
+		expectErrors   bool
+		errorSubstring string
+	}{
+		{
+			name:         "fresh cluster",
+			creationTime: now.Add(-time.Hour),
+		},
+		{
+			name:         "older than twelve hours warns and continues",
+			creationTime: now.Add(-clusterAgeWarningThreshold - time.Second),
+		},
+		{
+			name:         "exactly twelve hours is allowed",
+			creationTime: now.Add(-clusterAgeWarningThreshold),
+		},
+		{
+			name:         "exactly twenty-four hours is allowed",
+			creationTime: now.Add(-clusterAgeBlockingThreshold),
+		},
+		{
+			name:           "older than twenty-four hours is blocked",
+			creationTime:   now.Add(-clusterAgeBlockingThreshold - time.Second),
+			expectErrors:   true,
+			errorSubstring: "exceeds the 24-hour limit",
+		},
+		{
+			name:           "missing install manifests ConfigMap is blocked",
+			expectErrors:   true,
+			errorSubstring: "error getting install manifests ConfigMap",
+		},
+		{
+			name:           "ConfigMap client error is blocked",
+			creationTime:   now.Add(-time.Hour),
+			clientError:    errors.New("access denied"),
+			expectErrors:   true,
+			errorSubstring: "access denied",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objects := []runtime.Object{}
+			if !tt.creationTime.IsZero() {
+				objects = append(objects, &kcorev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              installManifestsConfigMapName,
+						Namespace:         installManifestsConfigMapNamespace,
+						CreationTimestamp: metav1.NewTime(tt.creationTime),
+					},
+				})
+			}
+
+			kclient := fake.NewSimpleClientset(objects...)
+			if tt.clientError != nil {
+				kclient.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, tt.clientError
+				})
+			}
+
+			errs := validateClusterAge(kclient.CoreV1(), now)
+			if tt.expectErrors != (len(errs) > 0) {
+				t.Fatalf("validateClusterAge() errors = %v, expectErrors = %t", errs, tt.expectErrors)
+			}
+			if tt.errorSubstring != "" && !strings.Contains(errs[0].Error(), tt.errorSubstring) {
+				t.Errorf("validateClusterAge() error = %q, want substring %q", errs[0], tt.errorSubstring)
+			}
+		})
+	}
+}
 
 // TestValidateOpctNamespace tests the validateOpctNamespace function
 func TestValidateOpctNamespace(t *testing.T) {
@@ -69,17 +150,17 @@ func TestValidateOpctNamespace(t *testing.T) {
 // TestValidateDedicatedNode tests the validateDedicatedNode function
 func TestValidateDedicatedNode(t *testing.T) {
 	tests := []struct {
-		name         string
-		dedicated    bool
+		name          string
+		dedicated     bool
 		existingNodes []kcorev1.Node
-		expectErrors bool
-		errorMessage string
+		expectErrors  bool
+		errorMessage  string
 	}{
 		{
-			name:         "dedicated mode disabled",
-			dedicated:    false,
+			name:          "dedicated mode disabled",
+			dedicated:     false,
 			existingNodes: []kcorev1.Node{},
-			expectErrors: false,
+			expectErrors:  false,
 		},
 		{
 			name:      "dedicated mode enabled - no nodes with label",

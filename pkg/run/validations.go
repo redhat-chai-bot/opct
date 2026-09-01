@@ -21,6 +21,13 @@ import (
 	"k8s.io/client-go/rest"
 )
 
+const (
+	installManifestsConfigMapNamespace = "openshift-config"
+	installManifestsConfigMapName      = "openshift-install-manifests"
+	clusterAgeWarningThreshold         = 12 * time.Hour
+	clusterAgeBlockingThreshold        = 24 * time.Hour
+)
+
 // PreRunValidations performs some validations before running the environment
 func (r *RunOptions) PreRunValidations(kclient kubernetes.Interface, restConfig *rest.Config) []error {
 	log.Info("Starting preflight validations")
@@ -54,6 +61,13 @@ func (r *RunOptions) PreRunValidations(kclient kubernetes.Interface, restConfig 
 	}
 
 	coreClient := kclient.CoreV1()
+
+	// Check the age of the cluster from the live install manifests ConfigMap.
+	errClusterAge := validateClusterAge(coreClient, time.Now())
+	if len(errClusterAge) > 0 {
+		log.Errorf("preflights checks failed: cluster age exceeds the supported limit: %v", errClusterAge)
+		allErrors = append(allErrors, fmt.Errorf("cluster age exceeds the supported limit: %v", errClusterAge))
+	}
 
 	// Check if dedicated node is set
 	errDedicatedNode := validateDedicatedNode(r, coreClient)
@@ -175,6 +189,31 @@ func validateImageRegistry(r *RunOptions, restConfig *rest.Config) []error {
 	}
 
 	return result
+}
+
+// validateClusterAge checks the live install manifests ConfigMap creation time.
+func validateClusterAge(coreClient corev1.CoreV1Interface, now time.Time) []error {
+	checkMsgPrefix := "Validating cluster age"
+	log.Debug(checkMsgPrefix)
+
+	installManifests, err := coreClient.ConfigMaps(installManifestsConfigMapNamespace).Get(
+		context.TODO(), installManifestsConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return []error{fmt.Errorf("%s: error getting install manifests ConfigMap: %w", checkMsgPrefix, err)}
+	}
+	if installManifests.CreationTimestamp.IsZero() {
+		return []error{fmt.Errorf("%s: install manifests ConfigMap has no creation timestamp", checkMsgPrefix)}
+	}
+
+	age := now.Sub(installManifests.CreationTimestamp.Time)
+	if age > clusterAgeBlockingThreshold {
+		return []error{fmt.Errorf("%s: cluster is %s old, which exceeds the 24-hour limit; install a fresh cluster and try again", checkMsgPrefix, age.Round(time.Second))}
+	}
+	if age > clusterAgeWarningThreshold {
+		log.Warnf("%s: cluster is %s old; clusters older than 24 hours cannot run OPCT", checkMsgPrefix, age.Round(time.Second))
+	}
+
+	return nil
 }
 
 // validateDedicatedNode validates that the dedicated node is set and has the required label and taints
