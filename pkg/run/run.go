@@ -508,7 +508,7 @@ func (r *RunOptions) Run(cli *client.Client) error {
 		configPlugins.Data["mirror-registry"] = r.imageRepository
 	}
 	configPlugins.Data["suiteNameKubernetesConformance"] = suiteNameKubernetesConformance
-	log.Infof("Setting configMapData[suiteNameKubernetesConformance] to %s", suiteNameKubernetesConformance)
+	log.Debugf("Setting configMapData[suiteNameKubernetesConformance] to %s", suiteNameKubernetesConformance)
 
 	if r.verbose {
 		versionJSON, err := json.MarshalIndent(configVersion, "", "  ")
